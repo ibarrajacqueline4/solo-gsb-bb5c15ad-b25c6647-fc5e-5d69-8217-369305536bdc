@@ -361,6 +361,64 @@ class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
 
+# ---------------------------------------------------------------------------
+# Value-free structural shape
+# ---------------------------------------------------------------------------
+
+
+class ShapeRequest(BaseModel):
+    document: Any = Field(
+        ...,
+        description=(
+            "The nested JSON document whose shape is requested. Scalar leaf "
+            "values do not participate in the shape hash."
+        ),
+    )
+
+
+class ShapeNode(BaseModel):
+    path: str = Field(
+        ...,
+        description=(
+            "RFC 6901 pointer of the node. '' is the document root; leaf "
+            "values themselves are never included, only the node and its "
+            "type."
+        ),
+    )
+    type: Literal["object", "array", "string", "number", "boolean", "null"] = (
+        Field(
+            ...,
+            description=(
+                "JSON type of the node. Integers and floats are both "
+                "`number`; true/false are `boolean`; empty {} and [] stay "
+                "`object`/`array` leaf nodes."
+            ),
+        )
+    )
+
+
+class ShapeResponse(BaseModel):
+    shapeHash: str = Field(
+        ...,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description=(
+            "SHA-256 digest (64 hex characters) of the document's shape, "
+            "computed bottom-up: object keys ordered by Unicode code point, "
+            "array order preserved, empty containers and scalar kinds "
+            "domain-tagged separately. Scalar values never enter the "
+            "preimage, so same-shaped documents with different leaf values "
+            "return the same hash."
+        ),
+    )
+    nodes: List[ShapeNode] = Field(
+        ...,
+        description=(
+            "Every node of the document (root included) as {path, type}, "
+            "with no leaf values, sorted by RFC 6901 pointer."
+        ),
+    )
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -435,6 +493,9 @@ def install_openapi(app: FastAPI) -> None:
                 RedactRequest,
                 AppliedRedaction,
                 RedactResponse,
+                ShapeRequest,
+                ShapeNode,
+                ShapeResponse,
                 ErrorResponse,
             )
         )
@@ -802,6 +863,74 @@ def install_openapi(app: FastAPI) -> None:
                                     {"path": "/subject/ssn", "action": "mask",
                                      "ruleIndex": 0,
                                      "pattern": "/subject/ssn"},
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/shape"] = {
+            "post": {
+                "summary": "List the value-free shape and its shapeHash",
+                "description": (
+                    "Walks the document and returns every node as an RFC "
+                    "6901 pointer plus its JSON type (`object`, `array`, "
+                    "`string`, `number`, `boolean`, `null`) — scalar leaf "
+                    "values are never included — together with a "
+                    "`shapeHash` computed bottom-up over the node tree. "
+                    "Object children are folded in Unicode code-point key "
+                    "order while array children keep their order. Leaf "
+                    "preimages are a single domain tag (null/boolean/"
+                    "number/string and distinct tags for empty object/array); "
+                    "container preimages carry a child count, and object "
+                    "members a length-prefixed key, followed by each child's "
+                    "32-byte digest. The domain tags and length prefixes make "
+                    "the framing unambiguous, and because scalar values do "
+                    "not participate, two documents have the same `shapeHash` "
+                    "exactly when they are structurally identical."
+                ),
+                "operationId": "shape",
+                "requestBody": _json_content(
+                    _ref("ShapeRequest"),
+                    example={
+                        "document": {
+                            "subject": {"name": "Ada", "age": 36, "active": True},
+                            "emails": ["ada@example.com", "ada@analytical.engine"],
+                            "emptyObj": {},
+                            "emptyArr": [],
+                            "nickname": None,
+                        }
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Value-free node inventory sorted by RFC 6901 "
+                            "pointer and the bottom-up shape hash."
+                        ),
+                        **_json_content(
+                            _ref("ShapeResponse"),
+                            example={
+                                "shapeHash": (
+                                    "1a28242fb787e006e5f8729a3458aaccd38a0e52"
+                                    "e703acbd49f488a1d5ed07d2"
+                                ),
+                                "nodes": [
+                                    {"path": "", "type": "object"},
+                                    {"path": "/emails", "type": "array"},
+                                    {"path": "/emails/0", "type": "string"},
+                                    {"path": "/emails/1", "type": "string"},
+                                    {"path": "/emptyArr", "type": "array"},
+                                    {"path": "/emptyObj", "type": "object"},
+                                    {"path": "/nickname", "type": "null"},
+                                    {"path": "/subject", "type": "object"},
+                                    {"path": "/subject/active",
+                                     "type": "boolean"},
+                                    {"path": "/subject/age", "type": "number"},
+                                    {"path": "/subject/name", "type": "string"},
                                 ],
                             },
                         ),

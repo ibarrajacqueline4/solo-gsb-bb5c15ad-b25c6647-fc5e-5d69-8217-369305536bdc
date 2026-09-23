@@ -284,6 +284,86 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 }
 ```
 
+### 10. 结构清单与同形哈希（`POST /shape`）
+
+`/shape` 接收一份 `document`，返回**不含任何叶值**的结构清单 `nodes`（每个节点一条
+`{"path", "type"}`，`path` 是 RFC 6901 指针、根节点为 `""`，按指针字符串排序）与一个
+`shapeHash`（SHA-256，64 位小写十六进制）。调用方据此可以比较两份 JSON 是否**同形**：
+容器结构相同、对象键相同、数组各位置的节点类型顺序相同，而标量叶的**具体值任意不同**。
+
+节点类型取 RFC 8259 的六种 JSON 类型：`object`、`array`、`string`、`number`、
+`boolean`、`null`。整数与浮点同为 `number`（`1` 与 `1.0` 同形），`true`/`false` 同为
+`boolean`；空对象 `{}`、空数组 `[]` 仍是 `object`/`array` 类型的叶节点，但在哈希中
+各有独立域标签。空容器与标量类型分别编码，**标量值本身不参与哈希**。
+
+哈希沿树**自底向上**计算（所有摘要为 SHA-256 的 32 字节）：
+
+```
+null 叶             SHA256(0x10)
+boolean 叶          SHA256(0x11)        # true / false 相同
+number 叶           SHA256(0x12)        # 整数/浮点、任意数值相同
+string 叶           SHA256(0x13)        # 任意字符串内容，含 "" 相同
+空对象 {}           SHA256(0x14)
+空数组 []           SHA256(0x15)
+
+非空对象            SHA256(
+                        0x20
+                     || u32be(成员数)
+                     || 对每个成员（对象键按 Unicode 码点序排列）：
+                            u32be(len(key_utf8)) || key_utf8 || 子节点摘要(32)
+                    )
+
+非空数组            SHA256(
+                        0x21
+                     || u32be(元素数)
+                     || 子节点摘要(32) * 元素数      # 数组保留顺序
+                    )
+```
+
+- 对象子节点按键名 **Unicode 码点序**归并（与「规范 JSON」一致），与请求里的键插入
+  顺序无关；数组子节点**保留位置顺序**；
+- 每个标签字节做**域分隔**（`0x10–0x15` 为叶域、`0x20/0x21` 为容器域），成员数、
+  键长度均为 4 字节大端长度前缀，子节点摘要固定 32 字节——节点类型与子节点边界都
+  带标签/长度前缀，任意两种不同形状不可能拼出相同原像（例如键序列 `["ab","c"]` 与
+  `["a","bc"]` 的摘要不同）；
+- 因此两份文档的 `shapeHash` 相等**当且仅当**它们同形；只改叶值（保持类型）哈希
+  不变，增删成员/元素、改键名、改某位置类型、`{}` 与 `[]` 互换都会改变哈希。
+
+请求：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 36, "active": true },
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "emptyObj": {},
+    "emptyArr": [],
+    "nickname": null
+  }
+}
+```
+
+成功（`200`）：
+
+```json
+{
+  "shapeHash": "1a28242fb787e006e5f8729a3458aaccd38a0e52e703acbd49f488a1d5ed07d2",
+  "nodes": [
+    { "path": "", "type": "object" },
+    { "path": "/emails", "type": "array" },
+    { "path": "/emails/0", "type": "string" },
+    { "path": "/emails/1", "type": "string" },
+    { "path": "/emptyArr", "type": "array" },
+    { "path": "/emptyObj", "type": "object" },
+    { "path": "/nickname", "type": "null" },
+    { "path": "/subject", "type": "object" },
+    { "path": "/subject/active", "type": "boolean" },
+    { "path": "/subject/age", "type": "number" },
+    { "path": "/subject/name", "type": "string" }
+  ]
+}
+```
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -560,6 +640,49 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 } }
 ```
 
+### `POST /shape` — 结构清单与同形哈希
+
+请求：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 36, "active": true },
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "emptyObj": {},
+    "emptyArr": [],
+    "nickname": null
+  }
+}
+```
+
+成功（`200`；`nodes` 列出全部节点的 RFC 6901 路径与类型、不含叶值，按路径排序；
+`shapeHash` 自底向上计算，细节见上文「10. 结构清单与同形哈希」）：
+
+```json
+{
+  "shapeHash": "1a28242fb787e006e5f8729a3458aaccd38a0e52e703acbd49f488a1d5ed07d2",
+  "nodes": [
+    { "path": "", "type": "object" },
+    { "path": "/emails", "type": "array" },
+    { "path": "/emails/0", "type": "string" },
+    { "path": "/emails/1", "type": "string" },
+    { "path": "/emptyArr", "type": "array" },
+    { "path": "/emptyObj", "type": "object" },
+    { "path": "/nickname", "type": "null" },
+    { "path": "/subject", "type": "object" },
+    { "path": "/subject/active", "type": "boolean" },
+    { "path": "/subject/age", "type": "number" },
+    { "path": "/subject/name", "type": "string" }
+  ]
+}
+```
+
+两份文档各自调用一次 `/shape` 并比较 `shapeHash`：相等即同形——只改叶值（保持
+JSON 类型）哈希不变；键名、成员/元素数、数组位置类型或空容器种类不同则哈希不同。
+非法请求体沿用统一错误体（`INVALID_JSON` / `INVALID_REQUEST` /
+`UNSUPPORTED_VALUE` / `PAYLOAD_TOO_LARGE`）。
+
 ### 错误码一览
 
 | HTTP | code | 触发场景（示例） |
@@ -583,6 +706,7 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
 - `POST /redact` → 按 RFC 6901 片段（字面量/`*`/`**`）确定性 mask/drop 叶路径，返回 redacted 文档与 applied 列表
+- `POST /shape` → 不含叶值的节点结构清单（RFC 6901 路径 + 类型）与自底向上的同形 `shapeHash`
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -637,6 +761,14 @@ curl -s localhost:8000/redact -H 'content-type: application/json' -d '{
     {"pattern": "/**", "action": "mask", "value": null}
   ]
 }'
+
+# 7) 结构清单与同形哈希：只改叶值（保持类型）shapeHash 不变
+curl -s localhost:8000/shape -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"], "empty": {}}
+}'
+# => {"shapeHash": "…", "nodes": [{"path": "", "type": "object"}, … ]}
+# 再发一份 {"subject": {"name": "…", "age": 99}, "emails": ["…", "…"], "empty": {}}
+# 会得到同一个 shapeHash；改键名/层级/类型则不同。
 ```
 
 ## 本地开发与测试（不使用 Docker）
@@ -651,16 +783,17 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
   redact.py      # 叶级脱敏引擎：RFC 6901 片段（字面量/*/**）匹配、mask/drop、规则优先级
+  shape.py       # 结构清单（RFC 6901 路径 + 节点类型）与自底向上的同形 shapeHash
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式与 /diff、/patch 的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /diff、/patch、/redact、/shape 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
 tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
 Dockerfile
