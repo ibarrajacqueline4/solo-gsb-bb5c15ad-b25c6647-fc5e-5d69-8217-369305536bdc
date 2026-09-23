@@ -357,6 +357,49 @@ class RedactResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Structural shape manifest
+# ---------------------------------------------------------------------------
+
+
+class ShapeRequest(BaseModel):
+    document: Any = Field(
+        ..., description="The JSON document to fingerprint structurally."
+    )
+
+
+class ShapeNodeModel(BaseModel):
+    path: str = Field(
+        ...,
+        description="RFC 6901 pointer of the node ('' is the document root).",
+    )
+    type: Literal["object", "array", "string", "number", "boolean", "null"] = (
+        Field(
+            ...,
+            description=(
+                "JSON node type. Scalar values are never reported — only "
+                "their type — so the manifest carries no payloads."
+            ),
+        )
+    )
+
+
+class ShapeResponse(BaseModel):
+    shapeHash: str = HexHash
+    nodeCount: int = Field(
+        ...,
+        ge=1,
+        description="Total number of nodes listed (the root included).",
+    )
+    nodes: List[ShapeNodeModel] = Field(
+        ...,
+        description=(
+            "Every node of the document, sorted by RFC 6901 pointer. "
+            "Containers list their descendants; scalar values never appear."
+        ),
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -435,6 +478,9 @@ def install_openapi(app: FastAPI) -> None:
                 RedactRequest,
                 AppliedRedaction,
                 RedactResponse,
+                ShapeRequest,
+                ShapeNodeModel,
+                ShapeResponse,
                 ErrorResponse,
             )
         )
@@ -802,6 +848,61 @@ def install_openapi(app: FastAPI) -> None:
                                     {"path": "/subject/ssn", "action": "mask",
                                      "ruleIndex": 0,
                                      "pattern": "/subject/ssn"},
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/shape"] = {
+            "post": {
+                "summary": "Structural manifest and shape hash of a document",
+                "description": (
+                    "Returns the value-free shape of `document`: every node "
+                    "listed by RFC 6901 pointer and JSON node type (scalars "
+                    "contribute only their type, never their value), plus a "
+                    "bottom-up SHA-256 `shapeHash`. The hash folds each "
+                    "node under a domain tag with length-prefixed "
+                    "boundaries: object members are sorted by key code "
+                    "point, array elements keep their order, empty "
+                    "containers and scalar types carry distinct tags, and "
+                    "scalar values never enter the preimage. Two documents "
+                    "have the same shape exactly when their `shapeHash` "
+                    "values are equal."
+                ),
+                "operationId": "shape",
+                "requestBody": _json_content(
+                    _ref("ShapeRequest"),
+                    example={
+                        "document": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "emails": ["ada@example.com"],
+                            "empty": {},
+                        },
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Path-sorted structural manifest and "
+                        "the bottom-up shape hash.",
+                        **_json_content(
+                            _ref("ShapeResponse"),
+                            example={
+                                "shapeHash": "ab" * 32,
+                                "nodeCount": 7,
+                                "nodes": [
+                                    {"path": "", "type": "object"},
+                                    {"path": "/emails", "type": "array"},
+                                    {"path": "/emails/0", "type": "string"},
+                                    {"path": "/empty", "type": "object"},
+                                    {"path": "/subject", "type": "object"},
+                                    {"path": "/subject/age",
+                                     "type": "number"},
+                                    {"path": "/subject/name",
+                                     "type": "string"},
                                 ],
                             },
                         ),

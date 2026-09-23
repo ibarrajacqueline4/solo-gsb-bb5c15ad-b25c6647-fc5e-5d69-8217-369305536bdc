@@ -284,6 +284,76 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 }
 ```
 
+### 10. 结构清单与同形哈希（`POST /shape`）
+
+`/shape` 接收一份 `document`，返回**不含任何叶值**的结构清单与整树同形哈希
+`shapeHash`：调用方无需上送两份原文，只需交换哈希即可比较两份 JSON 是否「同形」
+（节点类型与对象键名完全一致，标量值不参与比较）。
+
+- `nodes`：文档中**每个节点**（含根，根路径为 `""`）的 `{"path", "type"}`，按 RFC 6901
+  指针字符串排序；`type` 为 JSON 节点类型（`object` / `array` / `string` / `number` /
+  `boolean` / `null`），标量只出现类型、不出现值；
+- `nodeCount`：清单条目数（含根节点）；
+- `shapeHash`：自底向上计算的 SHA-256。每个节点的哈希原像以一字节**域标签**开头，
+  容器再带 **u32be 子节点计数**与**长度前缀的键名**——类型与子节点边界都有明确
+  分隔，不同结构的树不可能序列化出相同字节串（无拼接歧义）：
+
+```
+null        0x10
+boolean     0x11                              （true/false 不参与）
+number      0x12                              （值不参与）
+string      0x13                              （值不参与）
+空对象      0x14
+空数组      0x15
+object      0x16 || u32be(成员数)
+              || ( u32be(键名长度) || 键名UTF-8 || 子节点哈希 )*   （键按码点排序）
+array       0x17 || u32be(元素数) || 子节点哈希*                  （保留数组顺序）
+```
+
+规则细节：
+
+- 空容器与标量类型各自使用独立标签（与 Merkle 叶模型一致：空 `{}` / `[]` 是叶子）；
+- 对象键名参与哈希（键名是结构的一部分），成员先按 Unicode 码点排序再折叠，
+  因此**键序不影响哈希**；数组元素**保留顺序**，`[1, "x"]` 与 `["x", 1]` 不同形；
+- 标量值不进入任何原像：`36`→`41`、`"Ada"`→`"Bob"`、`1`→`1.0`、`true`→`false`
+  哈希都不变；改类型（`36`→`"36"`）、改键名、增删成员、调换数组顺序都会改变哈希；
+- 标签使用独立的 `0x1x` 区间，与 Merkle 叶（`0x00`）/ 内部节点（`0x01`）原像互不混淆；
+- 两份文档同形 ⟺ `shapeHash` 相等。
+
+请求：
+
+```json
+{
+  "document": {
+    "subject": {"name": "Ada", "age": 36},
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "empty": {}
+  }
+}
+```
+
+成功（`200`；清单只含路径与类型，不回显任何值）：
+
+```json
+{
+  "shapeHash": "d215b72418b62a38f5c0977983908b4a775f87b00a913bf5dc07e2883a6612b5",
+  "nodeCount": 8,
+  "nodes": [
+    {"path": "", "type": "object"},
+    {"path": "/emails", "type": "array"},
+    {"path": "/emails/0", "type": "string"},
+    {"path": "/emails/1", "type": "string"},
+    {"path": "/empty", "type": "object"},
+    {"path": "/subject", "type": "object"},
+    {"path": "/subject/age", "type": "number"},
+    {"path": "/subject/name", "type": "string"}
+  ]
+}
+```
+
+把 `36` 改成 `41`、`"Ada"` 改成 `"Bob"` 后 `shapeHash` 不变；把 `36` 改成 `"36"`
+（数字变字符串）或把 `"empty": {}` 改成 `[]`，`shapeHash` 即改变。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -583,6 +653,7 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
 - `POST /redact` → 按 RFC 6901 片段（字面量/`*`/`**`）确定性 mask/drop 叶路径，返回 redacted 文档与 applied 列表
+- `POST /shape` → 不含叶值的结构清单（路径+类型）与自底向上同形哈希 `shapeHash`
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -637,6 +708,15 @@ curl -s localhost:8000/redact -H 'content-type: application/json' -d '{
     {"pattern": "/**", "action": "mask", "value": null}
   ]
 }'
+
+# 7) 同形比较：两份文档分别取 shapeHash，相等即同形（标量值不参与）
+curl -s localhost:8000/shape -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"]}
+}'
+curl -s localhost:8000/shape -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Bob", "age": 41}, "emails": ["c@z", "d@w"]}
+}'
+# 两次响应的 shapeHash 相同；把 41 改成 "41"（字符串）再请求，哈希即改变
 ```
 
 ## 本地开发与测试（不使用 Docker）
@@ -651,10 +731,11 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
   redact.py      # 叶级脱敏引擎：RFC 6901 片段（字面量/*/**）匹配、mask/drop、规则优先级
+  shape.py       # 结构清单与自底向上同形哈希（域标签 + 长度前缀，标量值不参与）
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
